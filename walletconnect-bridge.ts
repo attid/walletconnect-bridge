@@ -202,9 +202,18 @@ class Bridge {
     this.consumePairingRequests().catch((e) => log("error", "consumePairingRequests", "fatal", { error: String(e) }));
     log("info", "Bridge.start", "pairing.consumer.started", { list: CH_PAIRING_REQUEST });
 
-    this.wallet.on("session_proposal", this.onSessionProposal);
-    this.wallet.on("session_request", this.onSessionRequest);
-    this.wallet.on("session_delete", this.onSessionDelete);
+    // Wrap async handlers to prevent unhandled rejections from crashing the process
+    const wrap = <T>(label: string, fn: (arg: T) => Promise<void>) => async (arg: T) => {
+      try {
+        await fn.call(this, arg);
+      } catch (e) {
+        log("error", label, "handler_exception", { error: String(e) });
+      }
+    };
+
+    this.wallet.on("session_proposal", wrap("session_proposal", this.onSessionProposal));
+    this.wallet.on("session_request", wrap("session_request", this.onSessionRequest));
+    this.wallet.on("session_delete", wrap("session_delete", this.onSessionDelete));
     log("info", "Bridge.start", "wallet.handlers.bound");
 
     await this.publishPairingEvent({ status: "ready", message: "WalletConnect bridge is ready" });
@@ -319,31 +328,32 @@ class Bridge {
   };
 
   private onSessionProposal = async (proposal: SignClientTypes.EventArguments["session_proposal"]) => {
-    log("info", "onSessionProposal", "enter", { id: proposal.id });
-    const { id, params } = proposal;
-    const required = params.requiredNamespaces || {};
-    const optional = (params as any).optionalNamespaces || {};
-    const meta = params.proposer?.metadata || {};
-    const pairingTopic: string | undefined = (params as any).pairingTopic;
-    log("debug", "onSessionProposal", "pairingTopic", { pairingTopic });
+    try {
+      log("info", "onSessionProposal", "enter", { id: proposal.id });
+      const { id, params } = proposal;
+      const required = params.requiredNamespaces || {};
+      const optional = (params as any).optionalNamespaces || {};
+      const meta = params.proposer?.metadata || {};
+      const pairingTopic: string | undefined = (params as any).pairingTopic;
+      log("debug", "onSessionProposal", "pairingTopic", { pairingTopic });
     log("debug", "onSessionProposal", "params", { required, optional, meta });
 
     // Prefer 'stellar' namespace from required, fallback to optional
-    const stellarNs = (required.stellar ?? optional.stellar) as any;
-    const chains: string[] = Array.from(new Set((stellarNs?.chains || []).map((c: string) => c)));
-    log("debug", "onSessionProposal", "chains", { chains });
+      const stellarNs = (required.stellar ?? optional.stellar) as any;
+      const chains: string[] = Array.from(new Set((stellarNs?.chains || []).map((c: string) => c)));
+      log("debug", "onSessionProposal", "chains", { chains });
 
-    if (!chains.some((c) => c === "stellar:pubnet" || c === "pubnet")) {
-      log("warn", "onSessionProposal", "reject.missing_pubnet", { id, chains });
-      await this.wallet.rejectSession({ id, reason: { code: 4000, message: "Required chain pubnet missing" } });
-      log("info", "onSessionProposal", "exit.reject");
-      return;
-    }
+      if (!chains.some((c) => c === "stellar:pubnet" || c === "pubnet")) {
+        log("warn", "onSessionProposal", "reject.missing_pubnet", { id, chains });
+        await this.wallet.rejectSession({ id, reason: { code: 4000, message: "Required chain pubnet missing" } });
+        log("info", "onSessionProposal", "exit.reject");
+        return;
+      }
 
-    const next = addressQueue.shift();
-    let address = next?.address as string | undefined;
-    let user_info = next?.user_info as Record<string, unknown> | undefined;
-    log("debug", "onSessionProposal", "dequeue", { address, has_user_info: !!user_info, queueLength: addressQueue.length });
+      const next = addressQueue.shift();
+      let address = next?.address as string | undefined;
+      let user_info = next?.user_info as Record<string, unknown> | undefined;
+      log("debug", "onSessionProposal", "dequeue", { address, has_user_info: !!user_info, queueLength: addressQueue.length });
 
     // Fallback: reuse binding from same pairing topic (session re-connect without new pairing request)
     if (!address && pairingTopic && this.pairingBindings.has(pairingTopic)) {
@@ -353,52 +363,58 @@ class Bridge {
       log("info", "onSessionProposal", "reuse.pairingBinding", { pairingTopic, address, has_user_info: !!user_info });
     }
 
-    if (!address) {
-      log("warn", "onSessionProposal", "reject.no_address", { id });
-      await this.wallet.rejectSession({ id, reason: { code: 4001, message: "No address bound for proposal" } });
-      log("info", "onSessionProposal", "exit.reject");
-      return;
-    }
+      if (!address) {
+        log("warn", "onSessionProposal", "reject.no_address", { id });
+        await this.wallet.rejectSession({ id, reason: { code: 4001, message: "No address bound for proposal" } });
+        log("info", "onSessionProposal", "exit.reject");
+        return;
+      }
 
-    const accounts = chains
-      .filter((c) => c === "stellar:pubnet" || c === "pubnet")
-      .map((c) => (c.includes(":") ? `${c}:${address}` : `stellar:${c}:${address}`));
+      const accounts = chains
+        .filter((c) => c === "stellar:pubnet" || c === "pubnet")
+        .map((c) => (c.includes(":") ? `${c}:${address}` : `stellar:${c}:${address}`));
 
-    const methods: string[] =
-      (stellarNs?.methods && Array.isArray(stellarNs.methods) && stellarNs.methods.length > 0)
-        ? stellarNs.methods
-        : ["stellar_signXDR", "stellar_signAndSubmitXDR"];
-    const events: string[] = Array.isArray(stellarNs?.events) ? stellarNs.events : [];
-    log("debug", "onSessionProposal", "ns.build", { accounts, methods, events });
+      const methods: string[] =
+        (stellarNs?.methods && Array.isArray(stellarNs.methods) && stellarNs.methods.length > 0)
+          ? stellarNs.methods
+          : ["stellar_signXDR", "stellar_signAndSubmitXDR"];
+      const events: string[] = Array.isArray(stellarNs?.events) ? stellarNs.events : [];
+      log("debug", "onSessionProposal", "ns.build", { accounts, methods, events });
 
-    const namespaces: SessionTypes.Namespaces = {
-      stellar: {
-        accounts,
-        methods,
-        events,
-      },
-    };
+      const namespaces: SessionTypes.Namespaces = {
+        stellar: {
+          accounts,
+          methods,
+          events,
+        },
+      };
 
-    const { topic } = await this.wallet.approveSession({ id, namespaces });
-    log("info", "onSessionProposal", "approved", { topic });
-    this.sessions.set(topic, { address, user_info, dapp: { name: meta.name, url: meta.url } });
-    log("debug", "onSessionProposal", "session.store", { topic, address, dapp: { name: meta.name, url: meta.url } });
+      const { topic } = await this.wallet.approveSession({ id, namespaces });
+      log("info", "onSessionProposal", "approved", { topic });
+      this.sessions.set(topic, { address, user_info, dapp: { name: meta.name, url: meta.url } });
+      log("debug", "onSessionProposal", "session.store", { topic, address, dapp: { name: meta.name, url: meta.url } });
 
     // Bind address to pairing topic for future proposals over same pairing
-    if (pairingTopic) {
-      this.pairingBindings.set(pairingTopic, { address, user_info });
-      log("debug", "onSessionProposal", "pairing.bind", { pairingTopic, address, has_user_info: !!user_info });
-    }
+      if (pairingTopic) {
+        this.pairingBindings.set(pairingTopic, { address, user_info });
+        log("debug", "onSessionProposal", "pairing.bind", { pairingTopic, address, has_user_info: !!user_info });
+      }
 
-    await this.publishPairingEvent({
-      status: "approved",
-      client_id: topic,
-      address,
-      dapp_info: { name: meta.name, url: meta.url },
-      user_info,
-      message: "Connected to dApp",
-    });
-    log("info", "onSessionProposal", "exit.success");
+      await this.publishPairingEvent({
+        status: "approved",
+        client_id: topic,
+        address,
+        dapp_info: { name: meta.name, url: meta.url },
+        user_info,
+        message: "Connected to dApp",
+      });
+      log("info", "onSessionProposal", "exit.success");
+    } catch (e) {
+      log("error", "onSessionProposal", "exception", { error: String(e) });
+      try {
+        await this.publishPairingEvent({ status: "failed", error: String(e) });
+      } catch {}
+    }
   };
 
   private onSessionDelete = async (args: SignClientTypes.EventArguments["session_delete"]) => {
@@ -504,6 +520,14 @@ class Bridge {
 (async () => {
   const b = new Bridge();
   log("info", "main", "starting");
+  // Global safety nets to avoid process crash
+  process.on("uncaughtException", (err) => {
+    try { log("error", "process", "uncaughtException", { error: String(err), stack: (err as any)?.stack }); } catch {}
+  });
+  process.on("unhandledRejection", (reason) => {
+    try { log("error", "process", "unhandledRejection", { reason: String(reason) }); } catch {}
+  });
+
   await b.start();
   // eslint-disable-next-line no-console
   console.log("FastStream-less Node bridge started. Channels:", {
